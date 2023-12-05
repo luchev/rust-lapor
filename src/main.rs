@@ -9,7 +9,7 @@ fn main() {
     let (client_config, server_config) = init("abcdefghijklmnopqrstuvwxyz".as_bytes().to_vec());
     let client = Client::new(client_config);
     let server = Server::new(server_config);
-    audit(&client, &server);
+    println!("{}", audit(&client, &server));
 }
 
 struct ClientConfig {
@@ -25,96 +25,13 @@ struct ServerConfig {
     file: Vec<u8>,
 }
 
-struct tinymt64 {
-    status: [u64; 2],
-    mat1: u32,
-    mat2: u32,
-    tmat: u64,
-}
-
-impl tinymt64 {
-    fn init(&mut self, seed: u64) {
-        self.status[0] = seed ^ ((self.mat1 as u64) << 32);
-        self.status[1] = self.mat2 as u64 ^ self.tmat;
-        for i in 1..MIN_LOOP {
-            self.status[i & 1] ^= (i as u128
-                + 6364136223846793005_u128
-                    * ((self.status[(i - 1) & 1] ^ (self.status[(i - 1) & 1] >> 62)) as u128))
-                as u64;
-        }
-        self.period_certification();
-    }
-
-    fn period_certification(&mut self) {
-        if (self.status[0] & TINYMT_MASK) == 0 && self.status[1] == 0 {
-            self.status[0] = 'T' as u64;
-            self.status[1] = 'M' as u64;
-        }
-    }
-
-    fn rand_mod_p(&mut self) -> u64 {
-        let mask = (1_u64 << P_BITS) - 1;
-        let mut val: u64;
-        loop {
-            val = self.generate_uint64() & mask;
-            if val < P57 {
-                break;
-            }
-        }
-        val
-    }
-
-    fn generate_uint64(&mut self) -> u64 {
-        self.next_state();
-        self.temper()
-    }
-
-    fn temper(&mut self) -> u64 {
-        let mut x: u64;
-        x = ((self.status[0] as u128 + self.status[1] as u128) % u64::MAX as u128) as u64;
-        x ^= self.status[0] >> 8;
-        x ^= (-((x & 1) as i64) & self.tmat as i64) as u64;
-        x
-    }
-
-    fn next_state(&mut self) {
-        let mut x: u64;
-        self.status[0] &= TINYMT_MASK;
-        x = self.status[0] ^ self.status[1];
-        x ^= x << 12;
-        x ^= x >> 32;
-        x ^= x << 32;
-        x ^= x << 11;
-        self.status[0] = self.status[1];
-        self.status[1] = x;
-        self.status[0] ^= (-((x & 1) as i64) & self.mat1 as i64) as u64;
-        self.status[1] ^= (-((x & 1) as i64) & ((self.mat2 as u64) << 32) as i64) as u64;
-    }
-
-    fn rand_vector(size: usize, seed: u64) -> Vec<u64> {
-        let mut state = tinymt64 {
-            status: [0; 2],
-            mat1: 0,
-            mat2: 0,
-            tmat: 0,
-        };
-        state.init(seed);
-
-        let mut vector = vec![0; size];
-        for i in 0..size {
-            vector[i] = state.rand_mod_p();
-        }
-        vector
-    }
-}
-
 fn init(file: Vec<u8>) -> (ClientConfig, ServerConfig) {
     let num_chunks = 1 + (file.len() - 1) / BYTES_UNDER_P;
     let n =
         (((num_chunks as f64).sqrt() / CHUNK_ALIGN as f64).ceil() * CHUNK_ALIGN as f64) as usize;
     let m = 1 + (num_chunks - 1) / n;
 
-    let vector_u = tinymt64::rand_vector(m, 2020);
+    let vector_u = Random::rand_vector(m, 2020);
 
     let mut partials1 = vec![0_u128; n];
     let bytes_per_row = BYTES_UNDER_P * n;
@@ -180,7 +97,7 @@ impl Client {
     }
 
     fn make_challenge_vector(&self, n: usize) -> Vec<u64> {
-        tinymt64::rand_vector(n, 20)
+        Random::rand_vector(n, 20)
     }
 
     fn audit(&self, challenge: Vec<u64>, response: Vec<u64>) -> bool {
@@ -297,5 +214,88 @@ mod test {
         let client = Client::new(client_config);
         let server = Server::new(server_config);
         assert!(audit(&client, &server));
+    }
+}
+
+struct Random {
+    status: [u64; 2],
+    mat1: u32,
+    mat2: u32,
+    tmat: u64,
+}
+
+impl Random {
+    fn init(&mut self, seed: u64) {
+        self.status[0] = seed ^ ((self.mat1 as u64) << 32);
+        self.status[1] = self.mat2 as u64 ^ self.tmat;
+        for i in 1..MIN_LOOP {
+            self.status[i & 1] ^= (i as u128
+                + 6364136223846793005_u128
+                    * ((self.status[(i - 1) & 1] ^ (self.status[(i - 1) & 1] >> 62)) as u128))
+                as u64;
+        }
+        self.period_certification();
+    }
+
+    fn period_certification(&mut self) {
+        if (self.status[0] & TINYMT_MASK) == 0 && self.status[1] == 0 {
+            self.status[0] = 'T' as u64;
+            self.status[1] = 'M' as u64;
+        }
+    }
+
+    fn rand_mod_p(&mut self) -> u64 {
+        let mask = (1_u64 << P_BITS) - 1;
+        let mut val: u64;
+        loop {
+            val = self.generate_uint64() & mask;
+            if val < P57 {
+                break;
+            }
+        }
+        val
+    }
+
+    fn generate_uint64(&mut self) -> u64 {
+        self.next_state();
+        self.temper()
+    }
+
+    fn temper(&mut self) -> u64 {
+        let mut x: u64;
+        x = ((self.status[0] as u128 + self.status[1] as u128) % u64::MAX as u128) as u64;
+        x ^= self.status[0] >> 8;
+        x ^= (-((x & 1) as i64) & self.tmat as i64) as u64;
+        x
+    }
+
+    fn next_state(&mut self) {
+        let mut x: u64;
+        self.status[0] &= TINYMT_MASK;
+        x = self.status[0] ^ self.status[1];
+        x ^= x << 12;
+        x ^= x >> 32;
+        x ^= x << 32;
+        x ^= x << 11;
+        self.status[0] = self.status[1];
+        self.status[1] = x;
+        self.status[0] ^= (-((x & 1) as i64) & self.mat1 as i64) as u64;
+        self.status[1] ^= (-((x & 1) as i64) & ((self.mat2 as u64) << 32) as i64) as u64;
+    }
+
+    fn rand_vector(size: usize, seed: u64) -> Vec<u64> {
+        let mut state = Random {
+            status: [0; 2],
+            mat1: 0,
+            mat2: 0,
+            tmat: 0,
+        };
+        state.init(seed);
+
+        let mut vector = vec![0; size];
+        for i in 0..size {
+            vector[i] = state.rand_mod_p();
+        }
+        vector
     }
 }
