@@ -7,6 +7,9 @@ const CHUNK_ALIGN: usize = 56;
 
 fn main() {
     let (client_config, server_config) = init("abcdefghijklmnopqrstuvwxyz".as_bytes().to_vec());
+    let client = Client::new(client_config);
+    let server = Server::new(server_config);
+    audit(&client, &server);
 }
 
 struct ClientConfig {
@@ -36,10 +39,8 @@ impl tinymt64 {
         for i in 1..MIN_LOOP {
             self.status[i & 1] ^= (i as u128
                 + 6364136223846793005_u128
-                    * (
-                        (self.status[(i - 1) & 1] ^ (self.status[(i - 1) & 1] >> 62)) as u128
-                    )
-                ) as u64;
+                    * ((self.status[(i - 1) & 1] ^ (self.status[(i - 1) & 1] >> 62)) as u128))
+                as u64;
         }
         self.period_certification();
     }
@@ -90,52 +91,56 @@ impl tinymt64 {
         self.status[1] ^= (-((x & 1) as i64) & ((self.mat2 as u64) << 32) as i64) as u64;
     }
 
-    fn rand_vector(&mut self, size: usize) -> Vec<u64> {
+    fn rand_vector(size: usize, seed: u64) -> Vec<u64> {
+        let mut state = tinymt64 {
+            status: [0; 2],
+            mat1: 0,
+            mat2: 0,
+            tmat: 0,
+        };
+        state.init(seed);
+
         let mut vector = vec![0; size];
         for i in 0..size {
-            vector[i] = self.rand_mod_p();
+            vector[i] = state.rand_mod_p();
         }
         vector
     }
 }
 
-fn init(mut file: Vec<u8>) -> (ClientConfig, ServerConfig) {
+fn init(file: Vec<u8>) -> (ClientConfig, ServerConfig) {
     let num_chunks = 1 + (file.len() - 1) / BYTES_UNDER_P;
     let n =
         (((num_chunks as f64).sqrt() / CHUNK_ALIGN as f64).ceil() * CHUNK_ALIGN as f64) as usize;
     let m = 1 + (num_chunks - 1) / n;
 
-    let seed = 2020;
-    let mut state = tinymt64 {
-        status: [0; 2],
-        mat1: 0,
-        mat2: 0,
-        tmat: 0,
-    };
-    state.init(seed);
-
-    let mut vector_u = vec![0; m];
-    for i in 0..m {
-        vector_u[i] = state.rand_mod_p();
-    }
+    let vector_u = tinymt64::rand_vector(m, 2020);
 
     let mut partials1 = vec![0_u128; n];
     let bytes_per_row = BYTES_UNDER_P * n;
     let chunk_mask = (1_u64 << (8 * BYTES_UNDER_P)) - 1;
-    let file_extended: Vec<u8> = file.clone().into_iter().chain(vec![0; bytes_per_row]).collect();
+    let file_extended: Vec<u8> = file
+        .clone()
+        .into_iter()
+        .chain(vec![0; bytes_per_row])
+        .collect();
     // file_extended.append(vec![0; bytes_per_row].as_mut());
 
     for i in 0..m {
         let mut raw_ind = 0;
         let raw_row = file_extended[(bytes_per_row * i)..bytes_per_row * (i + 1)].to_vec();
-        let raw_row = raw_row.chunks_exact(8).map(|x| u64::from_le_bytes(x.try_into().unwrap())).collect::<Vec<u64>>();
+        let raw_row = raw_row
+            .chunks_exact(8)
+            .map(|x| u64::from_le_bytes(x.try_into().unwrap()))
+            .collect::<Vec<u64>>();
         for full_ind in (0..n).step_by(8) {
             let mut data_val = (raw_row[raw_ind] & chunk_mask) as u128;
             partials1[full_ind] += data_val * vector_u[i] as u128;
 
             for k in 1..7 {
                 let data_val = ((raw_row[raw_ind + k - 1] >> (64 - k * 8))
-                    | ((raw_row[raw_ind + k] << (k * 8)) & chunk_mask)) as u128;
+                    | ((raw_row[raw_ind + k] << (k * 8)) & chunk_mask))
+                    as u128;
                 partials1[full_ind + k] += data_val * vector_u[i] as u128;
             }
 
@@ -149,17 +154,17 @@ fn init(mut file: Vec<u8>) -> (ClientConfig, ServerConfig) {
         partials1[k] %= P57 as u128;
     }
 
-    let client_config = ClientConfig{
+    let client_config = ClientConfig {
         rows: n,
         cols: m,
         secret_m_vector: vector_u,
         secret_n_vector: partials1.iter().map(|x| *x as u64).collect::<Vec<u64>>(),
     };
 
-    let server_config = ServerConfig{
+    let server_config = ServerConfig {
         rows: n,
         cols: m,
-        file: file,
+        file,
     };
 
     return (client_config, server_config);
@@ -171,15 +176,92 @@ struct Client {
 
 impl Client {
     fn new(config: ClientConfig) -> Self {
-        Self {
-            config,
-        }
+        Self { config }
     }
 
-    // fn make_challenge_vector(&self, n: usize) -> Vec<u64> {
-    //     let seed = 2020;
+    fn make_challenge_vector(&self, n: usize) -> Vec<u64> {
+        tinymt64::rand_vector(n, 20)
+    }
 
-    // }
+    fn audit(&self, challenge: Vec<u64>, response: Vec<u64>) -> bool {
+        let mut rxr1: u128 = 0;
+        let mut sxc1: u128 = 0;
+
+        for i in 0..self.config.cols {
+            rxr1 += response[i] as u128 * self.config.secret_m_vector[i] as u128;
+            if rxr1 > P57 as u128 {
+                rxr1 %= P57 as u128;
+            }
+        }
+
+        for i in 0..self.config.rows {
+            sxc1 += challenge[i] as u128 * self.config.secret_n_vector[i] as u128;
+            if sxc1 > P57 as u128 {
+                sxc1 %= P57 as u128;
+            }
+        }
+
+        return rxr1 == sxc1;
+    }
+}
+
+struct Server {
+    config: ServerConfig,
+}
+
+impl Server {
+    fn new(config: ServerConfig) -> Self {
+        Self { config }
+    }
+
+    fn retrieve(&self, challenge: Vec<u64>) -> Vec<u64> {
+        let mut dot_prods1 = vec![0_u128; self.config.cols];
+        let bytes_per_row = BYTES_UNDER_P * self.config.rows;
+        let chunk_mask = (1_u64 << (8 * BYTES_UNDER_P)) - 1;
+        let file_extended: Vec<u8> = self
+            .config
+            .file
+            .clone()
+            .into_iter()
+            .chain(vec![0; bytes_per_row])
+            .collect();
+
+        for i in 0..self.config.cols {
+            let mut raw_ind = 0;
+            let raw_row = file_extended[(bytes_per_row * i)..bytes_per_row * (i + 1)].to_vec();
+            let raw_row = raw_row
+                .chunks_exact(8)
+                .map(|x| u64::from_le_bytes(x.try_into().unwrap()))
+                .collect::<Vec<u64>>();
+            for full_ind in (0..self.config.rows).step_by(8) {
+                let mut data_val = (raw_row[raw_ind] & chunk_mask) as u128;
+                dot_prods1[i] += data_val * challenge[full_ind] as u128;
+
+                for k in 1..7 {
+                    let data_val = ((raw_row[raw_ind + k - 1] >> (64 - k * 8))
+                        | ((raw_row[raw_ind + k] << (k * 8)) & chunk_mask))
+                        as u128;
+                    dot_prods1[i] += data_val * challenge[full_ind + k] as u128;
+                }
+
+                data_val = (raw_row[raw_ind + 6] >> 8) as u128;
+                dot_prods1[i] += data_val * challenge[full_ind + 7] as u128;
+
+                raw_ind += 7;
+            }
+        }
+        for k in 0..self.config.cols {
+            dot_prods1[k] %= P57 as u128;
+        }
+
+        return dot_prods1.iter().map(|x| *x as u64).collect::<Vec<u64>>();
+    }
+}
+
+fn audit(client: &Client, server: &Server) -> bool {
+    let challenge = client.make_challenge_vector(server.config.rows);
+    let response = server.retrieve(challenge.clone());
+    client.audit(challenge, response)
 }
 
 #[cfg(test)]
@@ -192,135 +274,28 @@ mod test {
         assert_eq!(client_config.rows, 56);
         assert_eq!(client_config.cols, 1);
         assert_eq!(client_config.secret_m_vector, vec![57829946736570845]);
-        assert_eq!(client_config.secret_n_vector, vec![120891374367124132, 131035456404565768, 141179538442007404, 22254200296736808, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            client_config.secret_n_vector,
+            vec![
+                120891374367124132,
+                131035456404565768,
+                141179538442007404,
+                22254200296736808,
+            ].into_iter().chain(vec![0; 52].into_iter()).collect::<Vec<u64>>()
+        );
         assert_eq!(server_config.rows, 56);
         assert_eq!(server_config.cols, 1);
-        assert_eq!(server_config.file, "abcdefghijklmnopqrstuvwxyz".as_bytes().to_vec());
+        assert_eq!(
+            server_config.file,
+            "abcdefghijklmnopqrstuvwxyz".as_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn test_audit() {
+        let (client_config, server_config) = init("abcdefghijklmnopqrstuvwxyz".as_bytes().to_vec());
+        let client = Client::new(client_config);
+        let server = Server::new(server_config);
+        assert!(audit(&client, &server));
     }
 }
-
-// 			/* Audit */
-// 			// send op code to server
-// 			op = 'A';
-// 			my_fwrite(&op, 1, 1, sock);
-// 			fflush(sock);
-			
-// 			// create and send challenge vectors (of size n)
-// 			start_time(&timer);				/* START COMP TIMER */
-//             start_cpu_time(&cpu_timer);
-// 			uint64_t* challenge1;
-// 			uint64_t challengeBytes = n * sizeof(uint64_t);
-// 			challenge1 = makeChallengeVector(n);
-// 			client_comp_time = stop_time(&timer);		/* PAUSE COMP TIMER */
-//             client_cpu_time = stop_cpu_time(&cpu_timer);
-// 			start_time(&timer);				/* START COMM TIMER */
-// 			my_fwrite(challenge1, 1, challengeBytes, sock);
-// 			fflush(sock);
-
-// 			// wait for ACK from server
-// 			char ack = '0';
-// 			my_fread(&ack, 1, 1, sock);
-// 			if (ack == '1') comm_time = stop_time(&timer);	/* STOP COMM TIMER */
-// 			else printf("Did not receive ACK from server after sending challenge.\n");
-// 			printf("challenge[0] = %"PRIu64"\n", challenge1[0]);
-// 			printf("challenge[n-1] = %"PRIu64"\n", challenge1[n-1]);
-
-// 			// read response vectors from server (of size m)
-// 			uint64_t* response1 = calloc(m, sizeof(uint64_t));
-// 			uint64_t responseBytes = m * sizeof(uint64_t);
-// 			my_fread(response1, 1, responseBytes, sock);
-// 			printf("response[0] = %"PRIu64"\n", response1[0]);
-// 			printf("response[m-1] = %"PRIu64"\n", response1[m-1]);
-
-// 			// send previous comm_time as ack to server
-// 			my_fwrite(&comm_time, sizeof(comm_time), 1, sock);
-// 			fflush(sock);
-// 			fprintf(stderr, "Sent 1-way comm time of %f to server.\n", comm_time);
-
-// 			// run audit and report to client
-// 			// use m for size
-// 			start_time(&timer);				/* RESUME COMP TIMER */
-//             start_cpu_time(&cpu_timer);
-// 			int audit = runAudit(fconfig, challenge1,
-// 							response1, n, m);
-// 			client_comp_time += stop_time(&timer);		/* STOP TIMER */
-//             client_cpu_time += stop_cpu_time(&cpu_timer);
-// 			printf("Audit has ");
-// 			printf(audit ? "PASSED!\n" : "FAILED.\n");
-
-// 			//report computation time
-// 			fprintf(stderr, "***CLIENT COMP TIME: %f***\n***CLIENT CPU  TIME: %f ***\n***CLIENT COMM TIME: %f ***\n", client_comp_time, client_cpu_time, comm_time);
-
-// 			// clean up
-// 			free(challenge1);
-// 			free(response1);
-// 			break;
-
-//             uint64_t* makeChallengeVector(uint64_t size) {
-// 	// seed Tiny Mersenne Twister
-// 	uint64_t seed;
-// #if __APPLE__
-// 	if (getentropy(&seed, sizeof seed) == -1) {
-// 		fprintf(stderr, "getentropy failed\n");
-// 		exit(6);
-// 	}
-// #else
-// 	if (getrandom(&seed, sizeof seed, 0) != sizeof(seed)) {
-// 		fprintf(stderr, "getrandom failed\n");
-// 		exit(7);
-// 	}
-// #endif
-// 	tinymt64_t state = {0};
-// 	tinymt64_init(&state, seed);
-
-// 	// construct the randomized vector
-// 	uint64_t* vector = calloc(size, sizeof(uint64_t));
-// 	for (int i = 0; i < size; i++) {
-// 		vector[i] = rand_mod_p(&state);
-// 	}
-
-// 	return vector;
-// }
-
-// int runAudit(FILE* fconfig, uint64_t* challenge1,
-// 				uint64_t* response1, uint64_t n, uint64_t m) {
-// 	uint128_t rxr1 = 0;
-// 	uint128_t sxc1 = 0;
-
-// 	// compute dot products:
-// 	// random dot response & secret dot challenge.
-// 	// config file read through once
-// 	// doing modulo calc for each mul,
-// 	// doing one modulo after all addition at end.
-// 	size_t accum_count = 0;
-
-// 	uint64_t *temp = malloc(MAX(m,n) * sizeof *temp);
-// 	my_fread(temp, sizeof *temp, m, fconfig);
-
-// 	for (int i = 0; i < m; i++) { /*random1 dot response1 (m)*/
-// 		if ((accum_count += 2) > MAX_ACCUM_P) {
-// 			rxr1 %= P57;
-// 			accum_count = 2;
-// 		}
-// 		rxr1 += ((uint128_t)temp[i]) * response1[i];
-// 	}
-// 	rxr1 %= P57;
-// 	accum_count = 0;
-// 	my_fread(temp, sizeof *temp, n, fconfig);
-// 	for (int i = 0; i < n; i++) { /*secret1 dot challenge1 (n)*/
-// 		if ((accum_count += 2) > MAX_ACCUM_P) {
-// 			sxc1 %= P57;
-// 			accum_count = 2;
-// 		}
-// 		sxc1 += ((uint128_t)temp[i]) * challenge1[i];
-// 	}
-// 	sxc1 %= P57;
-// 	free(temp);
-
-// 	// check for equal and return result
-// 	// 1 for pass
-// 	// 0 for fail (default)
-// 	printf("rxr1 = %"PRIu64"\n", (uint64_t)rxr1);
-// 	printf("sxc1 = %"PRIu64"\n", (uint64_t)sxc1);
-// 	return (rxr1 == sxc1);
-// }
